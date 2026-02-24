@@ -1,14 +1,9 @@
 ---
 title: "Comparative Survival Analysis of Drug A vs Drug B Using Simulated Real‑World Data"
-author: "Hyemi Park"
-date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 output:
-  html_document:
-    number_sections: true
+  github_document:
     toc: true
-    toc_depth: 3
-params:
-  data_path: "pharmacoepi_survival_simulated.csv"
+    toc_depth: 2
 ---
 
 # Executive summary
