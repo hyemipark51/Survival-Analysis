@@ -1,0 +1,16 @@
+variable,description
+id,Unique patient identifier
+age,Age at index (years)
+sex_male,"1=male, 0=female"
+stage_IV,"1=Stage IV, 0=Stage III"
+comorbidity_score,Comorbidity score (0–10)
+prior_hosp_days_1y,Hospital days in prior year (0–60)
+ses,Socioeconomic status: Low/Medium/High
+region,Healthcare region (6 categories)
+year,Index year (2018–2025)
+biomarker,Prognostic biomarker group: A/B/C
+treat_drugA,"1=Drug A (new), 0=Drug B (standard)"
+treatment_delay_days,Days from diagnosis to treatment start (0–180)
+line_of_therapy,1st or 2nd line therapy
+time_years,"Observed follow-up time from index (years), censored at 5 years"
+event_death,"1=death observed, 0=censored"

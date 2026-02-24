@@ -1,0 +1,540 @@
+---
+title: "Comparative Survival Analysis of Drug A vs Drug B Using Simulated Real‑World Data"
+author: "Hyemi Park"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    number_sections: true
+    toc: true
+    toc_depth: 3
+params:
+  data_path: "pharmacoepi_survival_simulated.csv"
+---
+
+# Executive summary
+
+This report demonstrates a **comparative effectiveness** workflow for observational oncology research using simulated registry‑like data:
+
+- Describe baseline differences between treatment groups (**confounding check**).
+- Compare crude survival using Kaplan–Meier curves (**descriptive**).
+- Estimate an adjusted association using a multivariable Cox model (**measured confounding control**).
+- Re‑estimate using **propensity score inverse probability of treatment weighting (IPTW)** as a robustness analysis.
+- Explore **effect modification** by biomarker subgroup.
+
+# Background and objective
+
+In real‑world oncology research, treatment allocation is not randomized. Patients receiving different therapies often differ in age, disease severity, comorbidity, and socioeconomic factors, which can confound treatment–outcome associations.
+
+**Primary objective:** estimate the association between **Drug A vs Drug B** and **overall survival** (time to death).
+
+**Secondary objectives:**
+- Assess baseline imbalances (standardized mean differences, SMD).
+- Compare crude survival curves (Kaplan–Meier + log‑rank).
+- Evaluate robustness using propensity score weighting (stabilized IPTW).
+- Explore heterogeneity of treatment effect by biomarker (A/B/C).
+
+# Data description
+
+Simulated cohort (target N ≈ 12,000 patients), intended to mimic linked register data.
+
+- **Exposure:** `treat_drugA` (0 = Drug B, 1 = Drug A)
+- **Outcome:** `time_years` (follow‑up time in years), `event_death` (1 = death, 0 = censored)
+- **Baseline covariates (measured):**
+  - Demographics: `age`, `sex_male`
+  - Disease severity: `stage_IV`
+  - Health status: `comorbidity_score`, `prior_hosp_days_1y`
+  - Socioeconomic: `ses` (Low/Medium/High)
+  - Geography / health system: `region`
+  - Calendar time: `year`
+  - Biology: `biomarker` (A/B/C)
+
+# Methods
+
+## Overview
+
+1. **Baseline comparison** by treatment group  
+   - Create a Table 1 and compute SMD (imbalance threshold: |SMD| > 0.10).
+
+2. **Kaplan–Meier (KM)**  
+   - Plot unadjusted survival curves, report 1/3/5‑year survival, and log‑rank p‑value.
+
+3. **Adjusted Cox proportional hazards model**  
+   - Fit: `Surv(time_years, event_death) ~ treat + covariates`
+   - Report adjusted hazard ratio (HR) for Drug A vs Drug B with 95% CI.
+   - Check proportional hazards (PH) using `cox.zph()`.
+
+4. **Propensity score IPTW (robustness)**  
+   - Estimate propensity score (PS): `P(Drug A | covariates)`
+   - Compute **stabilized weights** to estimate an **ATE** (average treatment effect).
+   - Assess post‑weighting balance (SMD + love plot).
+   - Fit weighted Cox model with robust SE.
+   - Optional: weight truncation at 1st/99th percentiles to reduce influence of extreme weights.
+
+5. **Effect modification**  
+   - Fit interaction model: `treat * biomarker` + confounders
+   - Derive HR within each biomarker group via linear combinations.
+   - Visualize subgroup HRs (forest plot).
+
+---
+
+```{r setup }
+# Global chunk options for a clean report
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 7,
+  fig.height = 4
+)
+
+# Load packages
+required_pkgs <- c(
+  "dplyr", "ggplot2",
+  "survival", "survminer",
+  "tableone", "broom",
+  "cobalt"
+)
+
+missing_pkgs <- setdiff(required_pkgs, rownames(installed.packages()))
+if (length(missing_pkgs) > 0) {
+  stop("Missing packages: ", paste(missing_pkgs, collapse = ", "),
+       ". Please install them, e.g. install.packages(c(",
+       paste(sprintf('"%s"', missing_pkgs), collapse = ", "),
+       ")).")
+}
+
+library(dplyr)
+library(ggplot2)
+library(survival)
+library(survminer)
+library(tableone)
+library(broom)
+library(cobalt)
+```
+
+# 1. Import and prepare data
+
+```{r import}
+data_raw <- read.csv("pharmacoepi_survival_simulated.csv", stringsAsFactors = FALSE)
+
+# Quick peek
+dplyr::glimpse(data_raw)
+head(data_raw)
+```
+
+```{r clean}
+# Data cleaning + type casting
+# - Keep original variables, but create human-readable factors for modeling/plots
+data <- data_raw %>%
+  mutate(
+    # treatment coding: 0/1 -> factor with labels
+    treat_drugA = as.integer(treat_drugA),
+    treat = factor(treat_drugA, levels = c(0, 1), labels = c("Drug B", "Drug A")),
+
+    # outcome/event
+    event_death = as.integer(event_death),
+
+    # covariates
+    age = as.numeric(age),
+    sex_male = as.integer(sex_male),
+    stage_IV = factor(stage_IV, levels = c(0, 1), labels = c("No", "Yes")),
+    comorbidity_score = as.integer(comorbidity_score),
+    prior_hosp_days_1y = as.integer(prior_hosp_days_1y),
+    ses = factor(ses, levels = c("Low", "Medium", "High")),
+    region = factor(region),
+    year = as.integer(year),
+    biomarker = factor(biomarker, levels = c("A", "B", "C"))
+  )
+
+# Missingness table (counts of NA by variable)
+missing_tbl <- data %>% summarise(across(everything(), ~sum(is.na(.))))
+missing_tbl
+```
+
+> **Analysis dataset:** For simplicity, models below use complete‑case rows for the variables in each model.  
+> In applied work, you would consider multiple imputation or other missing data strategies when appropriate.
+
+# 2. Baseline characteristics 
+
+```{r table1}
+# Variables for baseline comparison
+vars <- c(
+  "age", "sex_male", "stage_IV",
+  "comorbidity_score", "prior_hosp_days_1y",
+  "ses", "region", "year", "biomarker"
+)
+
+tab1 <- CreateTableOne(
+  vars = vars,
+  strata = "treat",
+  data = data,
+  test = FALSE
+)
+
+# Print Table 1 with standardized mean differences
+print(tab1, smd = TRUE)
+```
+
+```{r smd_top}
+# Extract SMD and list the largest imbalances (absolute SMD)
+smd_vec <- ExtractSmd(tab1)
+smd_tbl <- tibble::tibble(
+  variable = names(smd_vec),
+  smd = as.numeric(smd_vec),
+  abs_smd = abs(as.numeric(smd_vec))
+) %>%
+  arrange(desc(abs_smd))
+
+smd_tbl %>% head(10)
+```
+
+# 3. Unadjusted survival (Kaplan–Meier)
+
+```{r km}
+# KM fit
+df_km <- data %>%
+  select(time_years, event_death, treat) %>%
+  filter(complete.cases(.))
+
+fit_km <- survfit(Surv(time_years, event_death) ~ treat, data = df_km)
+
+# Survival at 1, 3, 5 years
+km_times <- c(1, 3, 5)
+km_summ <- summary(fit_km, times = km_times)
+
+# Tidy survival estimates into a table
+km_tbl <- data.frame(
+  time_years = km_summ$time,
+  treat = gsub("^treat=", "", km_summ$strata),
+  surv = km_summ$surv,
+  lower = km_summ$lower,
+  upper = km_summ$upper
+)
+
+km_tbl
+```
+
+```{r km_plot}
+# Log-rank test (unadjusted)
+lr <- survdiff(Surv(time_years, event_death) ~ treat, data = df_km)
+logrank_p <- 1 - pchisq(lr$chisq, df = length(lr$n) - 1)
+
+# Plot KM curves
+ggsurvplot(
+  fit_km,
+  data = df_km,
+  risk.table = TRUE,
+  risk.table.height = 0.30,
+  risk.table.fontsize = 3.2,
+  conf.int = TRUE,
+  pval = TRUE,
+  pval.method = TRUE,
+  pval.size = 5,
+  xlab = "Years since treatment start",
+  ylab = "Overall survival probability",
+  legend.title = "Treatment",
+  legend.labs = c("Drug B", "Drug A")
+)
+```
+
+# 4. Adjusted Cox model (primary)
+
+```{r cox_primary}
+# Primary adjusted Cox PH model
+m1 <- coxph(
+  Surv(time_years, event_death) ~
+    treat + age + sex_male + stage_IV +
+    comorbidity_score + prior_hosp_days_1y +
+    ses + region + year + biomarker,
+  data = data
+)
+
+summary(m1)
+
+# Tidy HR table (exponentiated coefficients)
+cox_table <- tidy(m1, exponentiate = TRUE, conf.int = TRUE)
+cox_table
+```
+
+```{r cox_primary_hr}
+# Pull the main treatment effect (Drug A vs Drug B)
+hr_primary <- cox_table %>%
+  filter(term == "treatDrug A") %>%
+  transmute(
+    HR = estimate,
+    LCL = conf.low,
+    UCL = conf.high,
+    p_value = p.value,
+    HR_CI = sprintf("%.2f (%.2f–%.2f)", HR, LCL, UCL)
+  )
+
+hr_primary
+```
+
+```{r ph_assumption}
+# PH assumption check (Schoenfeld residual test)
+ph_test <- cox.zph(m1)
+ph_test
+```
+
+# 5. Propensity score IPTW (robustness)
+
+## 5.1 Estimate propensity scores
+
+```{r ps_model}
+# Propensity score model: P(Drug A | covariates)
+# Note: For stability, keep the same covariates as in the outcome model where possible.
+ps_mod <- glm(
+  I(treat == "Drug A") ~
+    age + sex_male + stage_IV +
+    comorbidity_score + prior_hosp_days_1y +
+    ses + region + year + biomarker,
+  data = data,
+  family = binomial()
+)
+
+data_w <- data %>%
+  mutate(
+    ps = predict(ps_mod, type = "response"),
+    treat_ind = as.integer(treat == "Drug A")  # 1=A, 0=B
+  )
+
+summary(data_w$ps)
+```
+
+```{r ps_overlap}
+# Propensity score overlap (positivity diagnostic)
+ggplot(data_w, aes(x = ps, fill = treat)) +
+  geom_histogram(bins = 40, position = "identity", alpha = 0.4) +
+  labs(
+    fill = "Treatment",
+    x = "Propensity score",
+    y = "Count",
+    title = "Propensity score distribution by treatment"
+  )
+```
+
+## 5.2 Stabilized weights + diagnostics
+
+```{r iptw_weights}
+# Stabilized IPTW for ATE
+p_treat <- mean(data_w$treat_ind == 1, na.rm = TRUE)
+p_ctrl  <- 1 - p_treat
+
+data_w <- data_w %>%
+  mutate(
+    sw = ifelse(treat_ind == 1, p_treat / ps, p_ctrl / (1 - ps))
+  )
+
+summary(data_w$sw)
+
+# Optional truncation to reduce influence of extreme weights
+w_lo <- quantile(data_w$sw, 0.01, na.rm = TRUE)
+w_hi <- quantile(data_w$sw, 0.99, na.rm = TRUE)
+
+data_w <- data_w %>%
+  mutate(sw_trunc = pmin(pmax(sw, w_lo), w_hi))
+
+summary(data_w$sw_trunc)
+```
+
+```{r iptw_weight_plot}
+# Weight distribution (truncated view for readability)
+ggplot(data_w, aes(x = sw_trunc)) +
+  geom_histogram(bins = 60) +
+  labs(x = "Stabilized weights (truncated at 1st/99th pct)", y = "Count",
+       title = "Distribution of stabilized IPTW")
+```
+
+## 5.3 Balance assessment (before vs after weighting)
+
+```{r balance}
+# Balance using cobalt after IPTW
+# Tip: set `un = TRUE` to get BOTH unweighted and weighted balance in one object
+bal_iptw <- bal.tab(
+  treat_ind ~ age + sex_male + stage_IV + comorbidity_score + prior_hosp_days_1y +
+    ses + region + year + biomarker,
+  data = data_w,
+  weights = data_w$sw_trunc,
+  estimand = "ATE",
+  un = TRUE
+)
+
+# Print balance summary (includes Unadjusted + Adjusted SMD)
+bal_iptw
+```
+
+```{r loveplot}
+# Love plot (visual check of balance)
+love.plot(
+  bal_iptw,
+  stat = "mean.diffs",
+  abs = TRUE,
+  thresholds = c(m = 0.1),
+  var.order = "unadjusted",
+  sample.names = c("Unweighted", "Weighted (IPTW)"),
+  title = "Covariate balance (|SMD|) before vs after IPTW"
+)
+```
+
+## 5.4 Weighted Cox model
+
+```{r cox_iptw}
+# Weighted Cox model using stabilized, truncated weights
+m_iptw <- coxph(
+  Surv(time_years, event_death) ~ treat,
+  data = data_w,
+  weights = sw_trunc,
+  robust = TRUE
+)
+
+summary(m_iptw)
+
+iptw_table <- tidy(m_iptw, exponentiate = TRUE, conf.int = TRUE)
+iptw_table
+```
+
+```{r compare_models}
+# Compare treatment HR across approaches
+hr_iptw <- iptw_table %>%
+  filter(term == "treatDrug A") %>%
+  transmute(
+    HR = estimate,
+    LCL = conf.low,
+    UCL = conf.high,
+    p_value = p.value,
+    HR_CI = sprintf("%.2f (%.2f–%.2f)", HR, LCL, UCL)
+  )
+
+bind_rows(
+  Primary_Adjusted_Cox = hr_primary,
+  IPTW_Weighted_Cox = hr_iptw,
+  .id = "model"
+) %>% select(model, HR_CI, p_value)
+```
+
+# 6. Effect modification by biomarker
+
+```{r interaction_model}
+# Interaction model: treat * biomarker
+m_int <- coxph(
+  Surv(time_years, event_death) ~
+    treat * biomarker +
+    age + sex_male + stage_IV +
+    comorbidity_score + prior_hosp_days_1y +
+    ses + region + year,
+  data = data
+)
+
+summary(m_int)
+```
+
+```{r subgroup_hr}
+# Compute subgroup HRs for Drug A vs Drug B within each biomarker group
+b <- coef(m_int)
+V <- vcov(m_int)
+
+hr_lincomb <- function(L, b, V) {
+  est <- sum(L * b)
+  se  <- sqrt(t(L) %*% V %*% L)
+  data.frame(
+    HR  = exp(est),
+    LCL = exp(est - 1.96 * se),
+    UCL = exp(est + 1.96 * se)
+  )
+}
+
+# Name vector length
+L_base <- rep(0, length(b)); names(L_base) <- names(b)
+
+# Reference biomarker is "A" by factor level order above
+L_A <- L_base; L_A["treatDrug A"] <- 1
+
+L_B <- L_base; L_B["treatDrug A"] <- 1
+if ("treatDrug A:biomarkerB" %in% names(b)) L_B["treatDrug A:biomarkerB"] <- 1
+
+L_C <- L_base; L_C["treatDrug A"] <- 1
+if ("treatDrug A:biomarkerC" %in% names(b)) L_C["treatDrug A:biomarkerC"] <- 1
+
+subg <- dplyr::bind_rows(
+  cbind(biomarker = "A", hr_lincomb(L_A, b, V)),
+  cbind(biomarker = "B", hr_lincomb(L_B, b, V)),
+  cbind(biomarker = "C", hr_lincomb(L_C, b, V))
+)
+
+subg
+```
+
+```{r forest}
+# Forest plot for subgroup HRs
+ggplot(subg, aes(x = biomarker, y = HR, ymin = LCL, ymax = UCL)) +
+  geom_pointrange() +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  coord_flip() +
+  labs(
+    x = "Biomarker group",
+    y = "Hazard Ratio (Drug A vs Drug B)",
+    title = "Treatment effect by biomarker subgroup (interaction model)"
+  )
+```
+
+# 7. Results (auto-populated when knitted)
+
+## Baseline imbalance
+
+Key imbalances (top 5 by |SMD|):
+
+```{r results_smd, echo=FALSE}
+smd_tbl %>% head(5)
+```
+
+Interpretation:
+- |SMD| > 0.10 suggests potentially meaningful imbalance, which motivates adjusted analyses.
+
+## Crude survival
+
+Log‑rank p‑value (Drug A vs Drug B): **`r signif(logrank_p, 3)`**
+
+1/3/5‑year KM survival estimates:
+
+```{r results_km, echo=FALSE}
+km_tbl
+```
+
+## Adjusted association (primary Cox)
+
+Adjusted HR for Drug A vs Drug B: **`r hr_primary$HR_CI`** (p = `r signif(hr_primary$p_value, 3)`)
+
+## IPTW robustness
+
+IPTW‑weighted HR for Drug A vs Drug B: **`r hr_iptw$HR_CI`** (p = `r signif(hr_iptw$p_value, 3)`)
+
+Balance after weighting:
+- Maximum |SMD| after weighting: **`r round(max(abs(bal_iptw$Balance$Diff.Adj), na.rm=TRUE), 3)`**  
+  (target: < 0.10)
+
+## Biomarker heterogeneity
+
+Subgroup HRs from interaction model:
+
+```{r results_subg, echo=FALSE}
+subg %>% mutate(
+  HR_CI = sprintf("%.2f (%.2f–%.2f)", HR, LCL, UCL)
+) %>% select(biomarker, HR_CI)
+```
+
+# 8. Discussion
+
+## Interpretation
+
+- The crude KM comparison reflects **both treatment effect and confounding**.
+- The adjusted Cox model estimates the association after controlling for measured confounders.
+- IPTW creates a pseudo‑population with improved covariate balance, reducing model dependence.
+- Biomarker interaction explores whether the treatment association differs across biological subtypes.
+
+## Assumptions and limitations
+
+- **No unmeasured confounding:** as in any observational analysis, residual confounding may remain.
+- **Positivity (overlap):** limited PS overlap can make IPTW unstable; inspect PS plots and weight distributions.
+- **PH assumption:** evaluate Schoenfeld tests/plots; consider time‑varying effects if violated.
+- **Simulated data:** results are illustrative and should not be interpreted as clinical truth.
